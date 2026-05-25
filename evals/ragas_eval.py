@@ -1,28 +1,33 @@
 """
 RAGAS Evaluation — Industry-standard RAG metrics
 
-Requires: pip install -r evals/requirements_ragas.txt
+Requires: python -m pip install ragas --no-deps
+          python -m pip install -r evals/requirements_ragas.txt
 
-Metrics:
-  Faithfulness       — answer only uses retrieved context (detects hallucination)
-  Response Relevancy — answer actually addresses the question
-  Context Precision  — retrieved chunks are relevant (retrieval quality)
-  LLM Context Recall — context contains enough info to answer (needs ground truth)
+Metrics (all on a 0.0 – 1.0 scale):
+  faithfulness       — answer only uses retrieved context (detects hallucination)
+  answer_relevancy   — answer actually addresses the question
+  context_precision  — retrieved chunks are relevant to the question (retrieval quality)
+  context_recall     — context contains enough info to answer correctly (retrieval coverage)
 
 How it works:
   1. Load test_cases.csv (same file your custom eval uses)
   2. Call /query for each question — collect answer + chunk texts
-  3. Run RAGAS metrics using OpenAI as the judge LLM
-  4. Print scores + save per-question CSV
+  3. Run RAGAS metrics using OpenAI gpt-4o-mini as the judge LLM
+  4. Print scores + save per-question CSV to evals/results/
 """
 
 import csv
 import os
 import sys
+import warnings
 from datetime import datetime
 
 import requests
 from dotenv import load_dotenv
+
+# Suppress ragas deprecation warnings — the old-style metric API still works fine
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 sys.stdout.reconfigure(encoding="utf-8")
 
@@ -39,20 +44,27 @@ os.makedirs(RESULTS_DIR, exist_ok=True)
 
 def _import_ragas():
     try:
+        from ragas.metrics import (
+            faithfulness,
+            answer_relevancy,
+            context_precision,
+            context_recall,
+        )
+        from ragas.llms import llm_factory
+        from langchain_openai import OpenAIEmbeddings
+        from openai import OpenAI as OpenAIClient
         from ragas import evaluate
         from ragas.dataset_schema import EvaluationDataset, SingleTurnSample
-        from ragas.metrics.collections import (
-            Faithfulness,
-            AnswerRelevancy,
-            ContextRecall,
-            ContextPrecisionWithReference,
+        return (
+            evaluate, EvaluationDataset, SingleTurnSample,
+            faithfulness, answer_relevancy, context_precision, context_recall,
+            llm_factory, OpenAIEmbeddings, OpenAIClient,
         )
-        from ragas.llms import LangchainLLMWrapper
-        from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-        return evaluate, EvaluationDataset, SingleTurnSample, Faithfulness, AnswerRelevancy, ContextRecall, ContextPrecisionWithReference, LangchainLLMWrapper, ChatOpenAI, OpenAIEmbeddings
     except ImportError as e:
         print(f"\nMissing dependency: {e}")
-        print("Run:  pip install -r evals/requirements_ragas.txt\n")
+        print("Run:")
+        print("  python -m pip install ragas --no-deps")
+        print("  python -m pip install -r evals/requirements_ragas.txt\n")
         sys.exit(1)
 
 
@@ -107,46 +119,49 @@ def collect_rag_outputs(test_cases: list[dict]) -> list[dict]:
 # ── RAGAS evaluation ─────────────────────────────────────────────────────────
 
 METRIC_DESCRIPTIONS = {
-    "faithfulness"                  : "answer only claims things in retrieved context (↑ = less hallucination)",
-    "answer_relevancy"              : "answer addresses the question (↑ = more on-point)",
-    "context_precision_with_reference": "retrieved chunks are relevant to the question (↑ = better retrieval)",
-    "context_recall"                : "context contained enough info to answer correctly (↑ = retrieval coverage)",
+    "faithfulness"     : "answer only claims things in retrieved context (↑ = less hallucination)",
+    "answer_relevancy" : "answer addresses the question (↑ = more on-point)",
+    "context_precision": "retrieved chunks are relevant to the question (↑ = better retrieval)",
+    "context_recall"   : "context contained enough info to answer correctly (↑ = retrieval coverage)",
 }
 
 
-def run_ragas_metrics(rows: list[dict]) -> dict:
+def run_ragas_metrics(rows: list[dict]):
     (evaluate, EvaluationDataset, SingleTurnSample,
-     Faithfulness, AnswerRelevancy, ContextRecall, ContextPrecisionWithReference,
-     LangchainLLMWrapper, ChatOpenAI, OpenAIEmbeddings) = _import_ragas()
+     faithfulness, answer_relevancy, context_precision, context_recall,
+     llm_factory, OpenAIEmbeddings, OpenAIClient) = _import_ragas()
 
     openai_key = os.getenv("OPENAI_API_KEY")
     if not openai_key:
         print("OPENAI_API_KEY not set in .env — RAGAS uses OpenAI as its judge LLM.")
         sys.exit(1)
 
-    llm        = LangchainLLMWrapper(ChatOpenAI(model="gpt-4o-mini", api_key=openai_key))
-    embeddings = OpenAIEmbeddings(api_key=openai_key)
+    # Wire up the LLM and embeddings to each metric
+    llm = llm_factory("gpt-4o-mini", client=OpenAIClient(api_key=openai_key))
+    lc_embeddings = OpenAIEmbeddings(api_key=openai_key)  # LangChain for embed_query interface
 
-    metrics = [
-        Faithfulness(llm=llm),
-        AnswerRelevancy(llm=llm, embeddings=embeddings),
-        ContextPrecisionWithReference(llm=llm),
-        ContextRecall(llm=llm),
-    ]
+    faithfulness.llm            = llm
+    context_precision.llm       = llm
+    context_recall.llm          = llm
+    answer_relevancy.llm        = llm
+    answer_relevancy.embeddings = lc_embeddings
 
+    # Build dataset
     samples = [
         SingleTurnSample(
-            user_input        = row["question"],
-            retrieved_contexts= row["contexts"],
-            response          = row["answer"],
-            reference         = row["ground_truth"],
+            user_input         = row["question"],
+            retrieved_contexts = row["contexts"],
+            response           = row["answer"],
+            reference          = row["ground_truth"],
         )
         for row in rows
     ]
 
     dataset = EvaluationDataset(samples=samples)
-    result  = evaluate(dataset=dataset, metrics=metrics)
-    return result
+    return evaluate(
+        dataset = dataset,
+        metrics = [faithfulness, context_precision, context_recall, answer_relevancy],
+    )
 
 
 # ── Output ───────────────────────────────────────────────────────────────────
@@ -154,29 +169,29 @@ def run_ragas_metrics(rows: list[dict]) -> dict:
 def print_summary(result) -> None:
     df = result.to_pandas()
 
-    print("\n" + "=" * 70)
+    print("\n" + "=" * 72)
     print("  RAGAS RESULTS  (scale: 0.0 – 1.0, higher is better)")
-    print("=" * 70)
+    print("=" * 72)
 
-    metric_keys = ["faithfulness", "answer_relevancy", "context_precision_with_reference", "context_recall"]
+    metric_keys = ["faithfulness", "context_precision", "context_recall", "answer_relevancy"]
     for key in metric_keys:
         if key in df.columns:
             score = df[key].mean()
             desc  = METRIC_DESCRIPTIONS.get(key, "")
             bar   = "█" * int(score * 20)
-            print(f"  {key:<25} {score:.3f}  {bar:<20}  {desc}")
+            print(f"  {key:<22} {score:.3f}  {bar:<20}  {desc}")
 
-    print("=" * 70)
+    print("=" * 72)
 
-    # Flag low-scoring questions per metric
+    # Flag low-scoring questions per metric (< 0.5)
     for key in metric_keys:
         if key not in df.columns:
             continue
         low = df[df[key] < 0.5]
         if not low.empty:
-            print(f"\n  Low {key} questions (score < 0.5):")
+            print(f"\n  Low {key} (score < 0.5):")
             for _, row in low.iterrows():
-                q = str(row.get("user_input", ""))[:60]
+                q = str(row.get("user_input", ""))[:65]
                 print(f"    {row[key]:.2f}  {q}")
 
     print()
@@ -185,7 +200,6 @@ def print_summary(result) -> None:
 def save_results(result, rows: list[dict], timestamp: str) -> str:
     df = result.to_pandas()
 
-    # Attach original question text if not already there
     if "user_input" not in df.columns:
         df.insert(0, "user_input", [r["question"] for r in rows])
 
@@ -215,7 +229,7 @@ def main():
     rows = collect_rag_outputs(test_cases)
 
     print(f"\nRunning RAGAS metrics on {len(rows)} samples")
-    print("(Uses OpenAI API as judge — takes ~2-3 minutes)\n")
+    print("(Uses OpenAI gpt-4o-mini as judge — takes ~3-5 minutes)\n")
 
     result = run_ragas_metrics(rows)
 
