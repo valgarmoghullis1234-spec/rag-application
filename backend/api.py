@@ -97,6 +97,7 @@ def query_stream(req: QueryRequest):
     return StreamingResponse(
         stream_question(req.question, source_filter=req.source_filter, history=history),
         media_type="application/x-ndjson",
+        headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
     )
 
 
