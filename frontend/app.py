@@ -20,7 +20,7 @@ from dotenv import load_dotenv
 
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 
-API_URL      = "http://localhost:8000"
+API_URL      = os.getenv("BACKEND_URL", "http://localhost:8000")
 APP_USERNAME = os.getenv("APP_USERNAME", "admin")
 APP_PASSWORD = os.getenv("APP_PASSWORD", "changeme123")
 

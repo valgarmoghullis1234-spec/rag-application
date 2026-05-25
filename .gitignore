@@ -1,6 +1,7 @@
 # Environment variables — never commit API keys
 .env
 .env.*
+!.env.example
 
 # Qdrant local database — large binary files, not needed in repo
 data/qdrant_db/
