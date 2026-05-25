@@ -51,13 +51,13 @@ def vector_search(question: str, source_filter: str | None = None, limit: int = 
             must=[FieldCondition(key="source", match=MatchValue(value=source_filter))]
         )
 
-    results = qdrant.search(
+    results = qdrant.query_points(
         collection_name=COLLECTION_NAME,
-        query_vector=query_embedding,
+        query=query_embedding,
         limit=limit,
         query_filter=query_filter,
         with_payload=True,
-    )
+    ).points
 
     return [
         {
