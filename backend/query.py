@@ -328,6 +328,7 @@ def _sources_payload(chunks: list[dict]) -> list[dict]:
             "similarity"   : c["similarity"],
             "match_type"   : c.get("match_type", "vector"),
             "rerank_score" : round(c.get("rerank_score", 0.0), 4),
+            "text"         : c["text"],
         }
         for c in chunks
     ]
