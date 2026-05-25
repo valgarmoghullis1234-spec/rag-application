@@ -1,0 +1,33 @@
+# Environment variables — never commit API keys
+.env
+.env.*
+
+# Qdrant local database — large binary files, not needed in repo
+data/qdrant_db/
+
+# Uploaded documents — user content, not source code
+data/uploads/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# OS files
+.DS_Store
+desktop.ini
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Eval results (auto-generated)
+evals/results/
