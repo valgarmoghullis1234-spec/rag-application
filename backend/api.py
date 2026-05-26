@@ -10,6 +10,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from ingest import ingest_document, list_documents, delete_document
 from query import answer_question, stream_question
+from agent import answer_agent, stream_agent
 
 UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -96,6 +97,44 @@ def query_stream(req: QueryRequest):
 
     return StreamingResponse(
         stream_question(req.question, source_filter=req.source_filter, history=history),
+        media_type="application/x-ndjson",
+        headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+    )
+
+
+# ── Agentic query endpoints ───────────────────────────────────────────────────
+
+@app.post("/query/agent")
+def query_agent(req: QueryRequest):
+    """
+    Agentic RAG — Claude drives multi-step retrieval with tools.
+    Better than /query for comparisons, multi-hop, and self-correcting searches.
+    Slower and more expensive; use for complex questions.
+    """
+    if not req.question.strip():
+        raise HTTPException(status_code=400, detail="Question cannot be empty.")
+    history = [{"role": m.role, "content": m.content} for m in req.history]
+    result  = answer_agent(req.question, source_filter=req.source_filter, history=history)
+    return result
+
+
+@app.post("/query/agent/stream")
+def query_agent_stream(req: QueryRequest):
+    """
+    Streaming agentic RAG.
+    Yields ndjson lines:
+      {"type": "agent_start"}
+      {"type": "tool_call",   "tool": "search",  "input": {...},   "iteration": 1}
+      {"type": "tool_result", "tool": "search",  "summary": "..."}
+      {"type": "token",       "text": "..."}
+      {"type": "done",        "tool_calls": [...], "iterations": N, "sources": [...]}
+    """
+    if not req.question.strip():
+        raise HTTPException(status_code=400, detail="Question cannot be empty.")
+    history = [{"role": m.role, "content": m.content} for m in req.history]
+
+    return StreamingResponse(
+        stream_agent(req.question, source_filter=req.source_filter, history=history),
         media_type="application/x-ndjson",
         headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
     )

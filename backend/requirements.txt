@@ -9,3 +9,4 @@ langchain-text-splitters==0.3.8
 openai==1.82.0
 requests==2.32.3
 python-dotenv==1.1.0
+langfuse>=2.0.0,<3.0.0

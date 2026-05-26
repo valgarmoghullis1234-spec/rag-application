@@ -26,8 +26,8 @@ openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # Fine-grained splitter used WITHIN each section
 _fine_splitter = RecursiveCharacterTextSplitter(
-    chunk_size=500,
-    chunk_overlap=50,       # reduced overlap — sections already isolate content
+    chunk_size=800,
+    chunk_overlap=150,
     length_function=len,
 )
 

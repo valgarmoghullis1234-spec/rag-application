@@ -26,13 +26,27 @@ from datetime import datetime
 import requests
 from dotenv import load_dotenv
 
-# Suppress ragas deprecation warnings — the old-style metric API still works fine
-warnings.filterwarnings("ignore", category=DeprecationWarning)
-
+# ── Load env vars FIRST — must happen before any SDK reads them ───────────────
 sys.stdout.reconfigure(encoding="utf-8")
 
 _here = os.path.abspath(os.path.dirname(__file__))
 load_dotenv(os.path.join(_here, "..", ".env"), override=True)
+
+# Suppress ragas deprecation warnings — the old-style metric API still works fine
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+# ── Langfuse score upload (optional — skipped gracefully if not installed) ────
+try:
+    from langfuse import Langfuse
+    _langfuse_client = Langfuse(
+        public_key = os.getenv("LANGFUSE_PUBLIC_KEY"),
+        secret_key = os.getenv("LANGFUSE_SECRET_KEY"),
+        host       = os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com"),
+    )
+    _LANGFUSE_ENABLED = True
+except Exception:
+    _langfuse_client  = None
+    _LANGFUSE_ENABLED = False
 
 API_URL        = os.getenv("BACKEND_URL", "http://localhost:8000")
 TEST_CASES_CSV = os.path.join(_here, "test_cases.csv")
@@ -103,6 +117,7 @@ def collect_rag_outputs(test_cases: list[dict]) -> list[dict]:
             chunk_texts = []
         else:
             answer      = result.get("answer", "")
+            answer      = answer[:600] + "..." if len(answer) > 600 else answer
             chunk_texts = [s["text"] for s in result.get("sources", []) if s.get("text")]
 
         rows.append({
@@ -112,6 +127,7 @@ def collect_rag_outputs(test_cases: list[dict]) -> list[dict]:
             "ground_truth": tc.get("Expected Answer", ""),
             "type"        : tc.get("Type", ""),
             "off_topic"   : result.get("off_topic", False),
+            "trace_id"    : result.get("trace_id"),   # Langfuse trace_id for score linking
         })
     return rows
 
@@ -197,6 +213,50 @@ def print_summary(result) -> None:
     print()
 
 
+def upload_scores_to_langfuse(result, rows: list[dict]) -> None:
+    """
+    Send per-question RAGAS scores to Langfuse so they appear in the
+    Scores tab and are linked to the originating trace in the waterfall.
+
+    Each score shows up in the Langfuse UI under:
+      Traces → <trace> → Scores tab
+      Dashboard → Scores chart (trend over time)
+    """
+    if not _LANGFUSE_ENABLED or _langfuse_client is None:
+        print("  (Langfuse not configured — skipping score upload)")
+        return
+
+    df            = result.to_pandas()
+    metric_keys   = ["faithfulness", "context_precision", "context_recall", "answer_relevancy"]
+    uploaded      = 0
+    eval_date_tag = datetime.now().strftime("%Y-%m-%d")
+
+    for i, row in df.iterrows():
+        trace_id = rows[i].get("trace_id") if i < len(rows) else None
+        if not trace_id:
+            continue   # no trace to link to — skip rather than create orphan scores
+
+        for metric in metric_keys:
+            if metric not in df.columns:
+                continue
+            value = row.get(metric)
+            if value is None or (hasattr(value, "__class__") and value != value):  # NaN check
+                continue
+            try:
+                _langfuse_client.score(
+                    trace_id = trace_id,
+                    name     = metric,
+                    value    = float(value),
+                    comment  = f"RAGAS eval — {eval_date_tag}",
+                )
+                uploaded += 1
+            except Exception as e:
+                print(f"    Warning: could not upload score for trace {trace_id}: {e}")
+
+    _langfuse_client.flush()   # ensure all scores are sent before the process ends
+    print(f"  {uploaded} scores uploaded to Langfuse ✓")
+
+
 def save_results(result, rows: list[dict], timestamp: str) -> str:
     df = result.to_pandas()
 
@@ -237,6 +297,11 @@ def main():
 
     path = save_results(result, rows, timestamp)
     print(f"Per-question scores saved to:\n  {path}\n")
+
+    print("Uploading scores to Langfuse...")
+    upload_scores_to_langfuse(result, rows)
+    if _LANGFUSE_ENABLED:
+        print("View traces at: https://cloud.langfuse.com\n")
 
 
 if __name__ == "__main__":

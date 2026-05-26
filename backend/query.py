@@ -13,16 +13,39 @@ import json
 import math
 import os
 from collections import Counter
+from dotenv import load_dotenv
+
+# load_dotenv FIRST — must run before any SDK reads env vars
+load_dotenv()
+
 from openai import OpenAI
 import anthropic
 from qdrant_client.models import Filter, FieldCondition, MatchValue
 from db import qdrant, COLLECTION_NAME
-from dotenv import load_dotenv
 
-load_dotenv()
+# ── Langfuse tracing ──────────────────────────────────────────────────────────
+try:
+    from langfuse.decorators import observe, langfuse_context
+    from langfuse import Langfuse as _LangfuseClient
+    _lf = _LangfuseClient(
+        public_key      = os.getenv("LANGFUSE_PUBLIC_KEY"),
+        secret_key      = os.getenv("LANGFUSE_SECRET_KEY"),
+        host            = os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com"),
+        flush_at        = 1,    # send every event immediately, don't wait to batch
+        flush_interval  = 0.1, # flush background queue every 100ms
+    )
+    _LANGFUSE_ENABLED = True
+except ImportError:
+    def observe(**kwargs):
+        def decorator(fn):
+            return fn
+        return decorator
+    langfuse_context = None
+    _lf              = None
+    _LANGFUSE_ENABLED = False
 
-RETRIEVE_K           = 10   # how many chunks to pull from vector DB before re-ranking
-TOP_K                = 5    # how many chunks to send to Claude after re-ranking
+RETRIEVE_K           = 20   # how many chunks to pull from vector DB before re-ranking
+TOP_K                = 10   # how many chunks to send to Claude after re-ranking
 FALLBACK_THRESHOLD   = 0.35 # if best similarity < this, also run keyword search
 GUARDRAIL_SIMILARITY = 0.30 # if best chunk similarity < this, question is off-topic
 
@@ -250,8 +273,10 @@ def _build_prompt(
         "Each context block is labelled with its source document and section. "
         "IMPORTANT: If the question cannot be answered from the context provided, respond with exactly: "
         "'I can only answer questions about the uploaded documents.' — do not use general knowledge. "
-        f"{synthesis_instruction} "
-        "Keep answers concise and directly relevant to the question."
+        "IMPORTANT: Never conclude that something does not exist simply because it is absent from the retrieved context — "
+        "the context may be incomplete. If you cannot find explicit evidence to confirm or deny something, say "
+        "'The provided context does not contain enough information to answer this definitively' rather than asserting a negative. "
+        f"{synthesis_instruction}"
     )
 
     user_message = (
@@ -263,7 +288,7 @@ def _build_prompt(
     )
 
     messages: list[dict] = []
-    for turn in (history or [])[-10:]:
+    for turn in (history or [])[-4:]:
         messages.append({"role": turn["role"], "content": turn["content"]})
     messages.append({"role": "user", "content": user_message})
 
@@ -282,7 +307,7 @@ def generate_answer(
 
     response = anthropic_client.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=1024,
+        max_tokens=1536,
         system=[{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}],
         messages=messages,
     )
@@ -303,7 +328,7 @@ def _stream_tokens(
 
     with anthropic_client.messages.stream(
         model="claude-sonnet-4-6",
-        max_tokens=1024,
+        max_tokens=1536,
         system=[{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}],
         messages=messages,
     ) as stream:
@@ -334,26 +359,57 @@ def _sources_payload(chunks: list[dict]) -> list[dict]:
     ]
 
 
+@observe(name="rag-query")
 def answer_question(
     question: str,
     source_filter: str | None = None,
     history: list[dict] | None = None,
 ) -> dict:
     """End-to-end: question → retrieve → guardrail → generate → return answer + sources."""
+    if _LANGFUSE_ENABLED and langfuse_context:
+        langfuse_context.update_current_trace(
+            input=question,
+            tags=["rag"],
+            metadata={"source_filter": source_filter},
+        )
+
     chunks = retrieve_chunks(question, source_filter=source_filter)
 
     best_similarity = max((c["similarity"] for c in chunks), default=0.0)
     if best_similarity < GUARDRAIL_SIMILARITY:
+        trace_id = None
+        if _LANGFUSE_ENABLED and langfuse_context:
+            trace_id = langfuse_context.get_current_trace_id()
+            langfuse_context.update_current_trace(
+                output=_OFF_TOPIC_MSG,
+                tags=["rag", "off-topic"],
+                metadata={"off_topic": True, "best_similarity": best_similarity},
+            )
         return {
             "question" : question,
             "answer"   : _OFF_TOPIC_MSG,
             "multi_doc": False,
             "sources"  : [],
             "off_topic": True,
+            "trace_id" : trace_id,
         }
 
     answer = generate_answer(question, chunks, history=history)
     unique_sources = {c["source"] for c in chunks}
+
+    trace_id = None
+    if _LANGFUSE_ENABLED and langfuse_context:
+        trace_id = langfuse_context.get_current_trace_id()
+        langfuse_context.update_current_trace(
+            output=answer,
+            metadata={
+                "off_topic"      : False,
+                "multi_doc"      : len(unique_sources) > 1,
+                "num_chunks"     : len(chunks),
+                "best_similarity": best_similarity,
+                "sources"        : list(unique_sources),
+            },
+        )
 
     return {
         "question" : question,
@@ -361,6 +417,7 @@ def answer_question(
         "multi_doc": len(unique_sources) > 1,
         "sources"  : _sources_payload(chunks),
         "off_topic": False,
+        "trace_id" : trace_id,
     }
 
 
@@ -375,10 +432,22 @@ def stream_question(
       {"type": "token", "text": "..."}   (repeated)
       {"type": "done"}
     """
+    # @observe doesn't work on generators — use low-level Langfuse API instead
+    trace = None
+    if _LANGFUSE_ENABLED and _lf:
+        trace = _lf.trace(
+            name    = "rag-query-stream",
+            input   = question,
+            tags    = ["rag", "stream"],
+            metadata= {"source_filter": source_filter},
+        )
+
     chunks = retrieve_chunks(question, source_filter=source_filter)
 
     best_similarity = max((c["similarity"] for c in chunks), default=0.0)
     if best_similarity < GUARDRAIL_SIMILARITY:
+        if trace:
+            trace.update(output=_OFF_TOPIC_MSG, tags=["rag", "stream", "off-topic"])
         yield json.dumps({"type": "metadata", "sources": [], "multi_doc": False, "off_topic": True}) + "\n"
         yield json.dumps({"type": "token", "text": _OFF_TOPIC_MSG}) + "\n"
         yield json.dumps({"type": "done"}) + "\n"
@@ -392,7 +461,21 @@ def stream_question(
         "off_topic": False,
     }) + "\n"
 
+    full_answer = ""
     for token in _stream_tokens(question, chunks, history=history):
+        full_answer += token
         yield json.dumps({"type": "token", "text": token}) + "\n"
 
     yield json.dumps({"type": "done"}) + "\n"
+
+    # Update trace with final answer after streaming completes
+    if trace:
+        trace.update(
+            output  = full_answer,
+            metadata= {
+                "source_filter"  : source_filter,
+                "num_chunks"     : len(chunks),
+                "best_similarity": best_similarity,
+                "sources"        : list(unique_sources),
+            },
+        )
